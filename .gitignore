@@ -1,0 +1,7 @@
+﻿.groq_key*
+__pycache__/
+*.pyc
+output/
+*_output/
+fix_test*/
+sample_*/

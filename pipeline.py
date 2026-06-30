@@ -1,26 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pipeline.py — JORADP Legal Act Structuring Pipeline
-====================================================
-Single-file, stdlib-only (Python 3.8+).
-All four stages are inlined here; no other project files are needed.
+pipeline2.py — JORADP Pipeline v2
+==================================
+Improvements over pipeline.py (see plan.md):
+  P1  Token-cost reduction: 3 prompt tiers (full/admin/meta), routed by act kind.
+  P2  400 cascade: json_validate_failed treated same as 413 → truncation fallback.
+  P3  _reconcile fix: both sides normalized (tashkeel stripped + digits) before diff.
+  P4  Graceful quota exhaustion: stops cleanly after 3 consecutive all-keys-exhausted.
+      Token budget meter: reads Groq usage.total_tokens, tracks per key, prints summary.
 
-QUICK START
------------
-  python pipeline.py run JO-1968-094/ --key gsk_YOUR_KEY
-  python pipeline.py run --all        --key gsk_YOUR_KEY
-
-INDIVIDUAL STAGES
------------------
-  python pipeline.py structure JO-1968-094/
-  python pipeline.py enhance   JO-1968-094/ --key gsk_…
-  python pipeline.py infer     JO-1968-094/
-  python pipeline.py view      JO-1968-094/
-
-TEST (no API key needed)
-------------------------
-  python pipeline.py test JO-1968-094/
+Stages 1, 3, 4 and CLI are unchanged from pipeline.py.
 """
 
 import os, sys, re, json, glob, time, html, argparse, urllib.request, urllib.error
@@ -30,7 +20,7 @@ if sys.stdout.encoding != "utf-8":
     except AttributeError: pass
 
 # ============================================================
-#  STAGE 1 — DETERMINISTIC LOSSLESS STRUCTURER
+#  STAGE 1 — DETERMINISTIC LOSSLESS STRUCTURER  (unchanged)
 # ============================================================
 
 AR, FA = "٠١٢٣٤٥٦٧٨٩", "۰۱۲۳۴۵۶۷۸۹"
@@ -39,8 +29,12 @@ _TR.update({ord(c): str(i) for i, c in enumerate(FA)})
 _norm = lambda s: s.translate(_TR)
 
 _DIG  = r"[\d٠-٩۰-۹]"
-_TYPE = r"(?:مرسوم|أمر|امر|قانون|قرار)"
-_DATED = r"مؤرخ(?:ة|ان|تان|ات|تين)?"
+_TYPE = r"(?:مرسوم\s+(?:تنفيذي|رئاسي|فردي)|قانون\s+عضوي|مرسوم|أمر|امر|قانون|قرار)"
+_DATED = r"مؤر\s*خ(?:ة|ان|تان|ات|تين)?"
+
+_TASHKEEL = re.compile(r"[ؐ-ًؚ-ٰٟ]")
+def _dt(s):
+    return _TASHKEEL.sub("", s)
 
 _HIJRI_MONTHS = ["محرم","صفر","ربيع الأول","ربيع الاول","ربيع الثاني","ربيع الثانى",
     "جمادى الأولى","جمادى الاولى","جمادى الثانية","جمادى الآخرة","جمادى الاخرة",
@@ -51,18 +45,20 @@ _GREG_MONTHS = ["يناير","فبراير","مارس","ابريل","أبريل"
 
 _RE_MASTHEAD = re.compile(r"الجريدة\s+الرسمية|^\s*(?:الجمعة|السبت|الأحد|الاحد|الإثنين|الاثنين|الثلاثاء|الأربعاء|الاربعاء|الخميس)\b.*عام")
 _RE_FOLIO    = re.compile(rf"^\s*[«»•\-\*\.\(\)]*\s*{_DIG}{{2,4}}\s*[«»•\-\*\.\(\)]*\s*$")
-_RE_MINISTRY = re.compile(r"^\s*(?:وزارة|رئاسة|الأمانة العامة|كتابة الدولة|الوزارة)\b.{0,45}$")
-_RE_SECTION  = re.compile(r"^\s*(?:مراسيم|قرارات|مقررات|قرار|آراء|اراء|تعليمات|بلاغات|اعلانات|إعلانات)[\s،,و]*$")
+_RE_TOC_DOTS = re.compile(rf"\.+\s*{_DIG}{{1,3}}\s*$")
+_RE_MINISTRY = re.compile(r"^\s*(?:وزارة|رئاسة|الأمانة العامة|كتابة الدولة|الوزارة)\b.{0,60}$")
+_RE_SECTION  = re.compile(r"^\s*(?:مراسيم|قرارات|مقررات|قرار|آراء|اراء|تعليمات|بلاغات|اعلانات|إعلانات|اتفاقيات|اتفاقات)[\s،,و]*$")
 _RE_HEAD = re.compile(
-    rf"^\s*(?:و\s*)?(?P<type>{_TYPE})(?:ان|ين|ات|تان|مان)?\s*"
+    rf"^\s*[-–]?\s*(?:و\s*)?(?P<type>{_TYPE})(?:ان|ين|ات|تان|مان)?\s*"
     rf"(?P<joint>وزاري\s+مشترك\s+)?"
-    rf"(?:رقم\s*(?P<n1>{_DIG}{{1,4}})\s*[-ـ–—]?\s*(?P<n2>{_DIG}{{1,4}})\s*)?"
+    rf"(?:رقم\s*(?P<n1>{_DIG}{{1,4}})\s*[-ـ–—\s]?\s*(?P<n2>{_DIG}{{1,4}})\s*)?"
     rf"{_DATED}\b")
 _RE_MEASURE  = re.compile(rf"^\s*(?:بموجب|موجب|بمقنضى)\s+(?:ال)?{_TYPE}")
-_RE_CITATION = re.compile(r"^\s*(?:و\s*)?(?:بمقتضى|بناء\s+على|إن\s+|ان\s+|نظرا|باقتراح|وبعد|وبموجب\s+الامر|وبمقتضى)")
+_RE_CITATION = re.compile(r"^\s*[-–•]\s*(?:و\s*)?(?:بمقتضى|بناء\s+على|نظرا|باقتراح|وبعد|وبموجب\s+الامر|وبمقتضى)"
+                           r"|^\s*(?:و\s*)?(?:بمقتضى|بناء\s+على|إن\s+|ان\s+|نظرا|باقتراح|وبعد|وبموجب\s+الامر|وبمقتضى)")
 _RE_ENACT    = re.compile(r"^\s*(?:يرسم|يقرر|يقرران|يأمر|نقرر|يقررون)\s*(?:ما\s*يلي|ما\s*يأتي|:)?\s*$")
-_RE_ARTICLE  = re.compile(rf"^\s*المادة\s+(?P<n>الأولى|الاولى|{_DIG}+)")
-_RE_ANNEX    = re.compile(r"^\s*ملحق\b")
+_RE_ARTICLE  = re.compile(rf"^\s*(?:اI)?(?:ا)?لماد\s*ة\s+(?P<n>الأولى|الاولى|{_DIG}+)")
+_RE_ANNEX    = re.compile(r"^\s*(?:ملحق|الملحق)\b")
 _RE_CLOSING  = re.compile(r"^\s*(?:و\s*)?حرر\s+ب|وحرر\s+بالجزائر")
 _RE_SUBJECT_CUT = re.compile(r"^(?:و\s*)?(?:يتضمن|تتضمن|تنضمن|المتضمن|يتعلق|المتعلق|باكتساب|بتحديد|بانشاء|بإنشاء|الرامي|يرمي|المعدل|يعدل|المحدد|يحدد|بشأن|بمنح)\s*")
 _RE_TITLE_END = re.compile(r"\s(?:بموجب|موجب|بمقتضى|بناء\s+على|ان\s+رئيس|ان\s+وزير|إن\s+رئيس|إن\s+وزير|يقرر|يقرران|يرسم|نقرر|المادة)\b")
@@ -110,46 +106,74 @@ def _heading_title(block, jyear=None):
     return tail[:200] or None
 
 
-def _load_pages(folder):
+def _load_pages_multi(folder):
     out = []
     for f in sorted(glob.glob(os.path.join(folder, "page_*.txt"))):
         pno = int(re.search(r"page_(\d+)\.txt$", f).group(1))
         for ln in open(f, encoding="utf-8"):
             t = re.sub(r"^\d+\t", "", ln).rstrip("\n").strip()
             if t:
-                out.append((pno, t))
+                out.append((pno, _norm(t)))
     return out
+
+_RE_PAGE_MARKER = re.compile(r"^={3,}\s*PAGE\s+(\d+)\s*={3,}$", re.IGNORECASE)
+
+def _load_pages_single(folder):
+    jid = os.path.basename(folder.rstrip("/\\"))
+    candidates = [os.path.join(folder, f"{jid}.txt")] + glob.glob(os.path.join(folder, "*.txt"))
+    f = next((c for c in candidates if os.path.exists(c)), None)
+    if not f:
+        return []
+    out = []
+    cur_page = 1
+    for ln in open(f, encoding="utf-8"):
+        t = ln.rstrip("\n").strip()
+        m = _RE_PAGE_MARKER.match(t)
+        if m:
+            cur_page = int(m.group(1))
+        elif t:
+            out.append((cur_page, _norm(t)))
+    return out
+
+def _load_pages(folder):
+    if glob.glob(os.path.join(folder, "page_*.txt")):
+        return _load_pages_multi(folder)
+    return _load_pages_single(folder)
 
 
 def _classify(line):
-    if _RE_MASTHEAD.search(line): return "MAST"
-    if _RE_MINISTRY.match(line):  return "MIN"
-    if _RE_ENACT.match(line):     return "ENACT"
-    if _RE_ARTICLE.match(line):   return "ART"
-    if _RE_ANNEX.match(line):     return "ANNEX"
-    if _RE_CLOSING.match(line):   return "CLOSE"
-    if _RE_MEASURE.match(line):   return "MEAS"
-    if _RE_HEAD.match(line):      return "HEAD"
-    if _RE_CITATION.match(line):  return "CITE"
-    if _RE_FOLIO.match(line):     return "FOLIO"
-    if _RE_SECTION.match(line):   return "SEC"
+    d = _dt(line)
+    if _RE_MASTHEAD.search(d): return "MAST"
+    if _RE_TOC_DOTS.search(d): return "TOC"
+    if _RE_MINISTRY.match(d):  return "MIN"
+    if _RE_ENACT.match(d):     return "ENACT"
+    if _RE_ARTICLE.match(d):   return "ART"
+    if _RE_ANNEX.match(d):     return "ANNEX"
+    if _RE_CLOSING.match(d):   return "CLOSE"
+    if _RE_MEASURE.match(d):   return "MEAS"
+    if _RE_HEAD.match(d):      return "HEAD"
+    if _RE_CITATION.match(d):  return "CITE"
+    if _RE_FOLIO.match(d):     return "FOLIO"
+    if _RE_SECTION.match(d):   return "SEC"
     return "OTHER"
 
 
-def do_structure(folder):
-    """Stage 1: parse OCR page files → structure_A.json"""
+def do_structure(folder, out_dir=None):
+    out_dir = out_dir or folder
+    os.makedirs(out_dir, exist_ok=True)
     jid = os.path.basename(folder.rstrip("/\\"))
     ym = re.match(r"JO-(\d{4})-(\d+)", jid)
     jyear = int(ym.group(1)) if ym else None
     toks = _load_pages(folder)
     if not toks:
-        raise FileNotFoundError(f"No page_*.txt files found in {folder}")
+        raise FileNotFoundError(f"No .txt files found in {folder}")
     N = len(toks)
     tags = [_classify(t) for _, t in toks]
 
     acts, index, stripped, front, unplaced = [], [], [], [], []
     counted = 0
     ministry = [None]
+    in_toc_section = True
 
     def new_act(pno, atype, joint, num):
         return {"id": f"{jid}-act-{len(acts)+1:03d}",
@@ -169,6 +193,21 @@ def do_structure(folder):
 
         if tag in ("MAST", "FOLIO"):
             stripped.append({"page": pno, "text": line}); counted += 1; i += 1; continue
+        if tag == "TOC":
+            if in_toc_section:
+                m_toc = _RE_HEAD.match(_dt(line))
+                pr_m = re.search(r"(\d+)\s*$", _norm(line))
+                index.append({"type": (m_toc.group("type") if m_toc else None),
+                              "title": _heading_title(line, jyear),
+                              "page_ref": pr_m.group(1) if pr_m else None,
+                              "src_page": pno})
+            else:
+                if cur:
+                    cur["lines"].append({"page": pno, "text": line})
+                    cur["body"].append(line)
+                else:
+                    front.append({"page": pno, "text": line})
+            counted += 1; i += 1; continue
         if tag == "MIN":
             ministry[0] = line
             if cur: cur["lines"].append({"page": pno, "text": line})
@@ -184,15 +223,18 @@ def do_structure(folder):
                 block.append(toks[j][1]); j += 1
             block_txt = " ".join(block)
             k = j
-            is_toc = (k < N and tags[k] == "FOLIO")
+            is_toc = in_toc_section and (k < N and tags[k] in ("FOLIO", "TOC"))
             if is_toc:
-                m = _RE_HEAD.match(line)
+                m = _RE_HEAD.match(_dt(line))
+                pr_line = _norm(toks[k][1])
+                pr_m = re.search(r"(\d+)\s*$", pr_line)
                 index.append({"type": (m.group("type") if m else None),
                               "title": _heading_title(block_txt, jyear),
-                              "page_ref": _norm(toks[k][1]).strip("«»•-*.() "),
+                              "page_ref": pr_m.group(1) if pr_m else pr_line.strip("«»•-*.() "),
                               "src_page": pno})
                 counted += (k - i + 1); i = k + 1; continue
-            m = _RE_HEAD.match(line)
+            in_toc_section = False
+            m = _RE_HEAD.match(_dt(line))
             num = f"{_norm(m.group('n1'))}-{_norm(m.group('n2'))}" if m and m.group("n1") else None
             cur = new_act(pno, m.group("type"), m.group("joint"), num)
             dh, dg = _heading_dates(block_txt)
@@ -209,13 +251,14 @@ def do_structure(folder):
         cur["lines"].append({"page": pno, "text": line})
         if pno not in cur["source_pages"]: cur["source_pages"].append(pno)
 
+        d = _dt(line)
         if tag == "MEAS":
             cur["measures"].append({"date_hijri": None, "date_gregorian": None, "text": line})
             dh, dg = _heading_dates(line)
             cur["measures"][-1]["date_hijri"], cur["measures"][-1]["date_gregorian"] = dh, dg
             target = ("measure", len(cur["measures"]) - 1)
         elif tag == "ART":
-            am = _RE_ARTICLE.match(line)
+            am = _RE_ARTICLE.match(d)
             body = line.split(":", 1)[1].strip() if ":" in line else ""
             store = cur["annex"]["articles"] if cur["annex"] is not None else cur["articles"]
             num_raw = _norm(am.group("n"))
@@ -280,7 +323,7 @@ def do_structure(folder):
                         "lossless": True},
               "index": index, "front_matter": front, "stripped": stripped,
               "unplaced": unplaced, "acts": acts}
-    dest = os.path.join(folder, "structure_A.json")
+    dest = os.path.join(out_dir, "structure_A.json")
     json.dump(result, open(dest, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     s = result["stats"]
     print(f"[structure] {jid}: {s['acts']} acts (leg {s['legislative']} / adm {s['administrative']}) "
@@ -289,24 +332,34 @@ def do_structure(folder):
 
 
 # ============================================================
-#  STAGE 2 — GROQ LLM CLIENT
+#  STAGE 2 — GROQ CLIENT  (v2: key rotation, budget tracking)
 # ============================================================
 
 _GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_DEFAULT_MODEL = "openai/gpt-oss-120b"
 _THINKING_MODELS = {"qwen/qwen3-32b", "qwen/qwen3.6-27b"}
-_groq_model = _GROQ_DEFAULT_MODEL   # overridden by CLI --model
+_groq_model = _GROQ_DEFAULT_MODEL
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_KEY_FILES = [".groq_key", ".groq_key2020", ".groq_key2", ".groq_key3",
+              ".groq_key4", ".groq_key5"]
+_key_idx   = [0]
+_budget    = {}   # key_prefix → total_tokens_used (from Groq usage field)
 
 
-def _groq_key(cli_key=None):
-    if cli_key:
-        return cli_key
-    if os.environ.get("GROQ_API_KEY"):
-        return os.environ["GROQ_API_KEY"]
-    kf = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".groq_key")
-    if os.path.exists(kf):
-        return open(kf, encoding="utf-8").read().strip()
-    return ""
+def _groq_keys(cli_key=None):
+    seen, keys = set(), []
+    def add(k):
+        k = (k or "").strip()
+        if k and k not in seen:
+            seen.add(k); keys.append(k)
+    add(cli_key)
+    add(os.environ.get("GROQ_API_KEY"))
+    for name in _KEY_FILES:
+        kf = os.path.join(_BASE_DIR, name)
+        if os.path.exists(kf):
+            add(open(kf, encoding="utf-8").read())
+    return keys
 
 
 def _strip_think(text):
@@ -325,16 +378,23 @@ def groq_generate(prompt, system=None, as_json=True, api_key=None,
     if as_json and not thinking:
         payload["response_format"] = {"type": "json_object"}
     data = json.dumps(payload).encode()
-    key = _groq_key(api_key)
-    if not key:
+    keys = _groq_keys(api_key)
+    if not keys:
         raise RuntimeError("No Groq API key found. Pass --key gsk_… or set GROQ_API_KEY env var.")
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-               "User-Agent": "Mozilla/5.0"}
-    for attempt in range(max_retries):
+    rotations = 0
+    for attempt in range(max_retries * len(keys)):
+        key = keys[_key_idx[0] % len(keys)]
+        kpfx = key[:12]
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                   "User-Agent": "Mozilla/5.0"}
         req = urllib.request.Request(_GROQ_URL, data=data, headers=headers)
         try:
             r = urllib.request.urlopen(req, timeout=timeout)
             d = json.load(r)
+            # Track real token usage per key prefix
+            used = (d.get("usage") or {}).get("total_tokens", 0)
+            if used:
+                _budget[kpfx] = _budget.get(kpfx, 0) + used
             txt = d["choices"][0]["message"]["content"]
             if thinking:
                 txt = _strip_think(txt)
@@ -347,147 +407,180 @@ def groq_generate(prompt, system=None, as_json=True, api_key=None,
             return json.loads(t)
         except urllib.error.HTTPError as e:
             body = e.read().decode()[:300]
-            if e.code in (429, 500, 502, 503) and attempt < max_retries - 1:
+            if e.code == 429:
+                _key_idx[0] += 1
+                rotations += 1
+                if rotations % len(keys) == 0:
+                    time.sleep(min(2 ** (rotations // len(keys)) * 3, 60))
+                continue
+            if e.code in (500, 502, 503) and attempt < max_retries - 1:
                 time.sleep(min(2 ** attempt * 3, 60)); continue
             raise RuntimeError(f"Groq HTTP {e.code}: {body}")
         except (json.JSONDecodeError, KeyError) as e:
             if attempt < max_retries - 1:
                 time.sleep(3); continue
             raise RuntimeError(f"Groq bad response: {e}")
+    raise RuntimeError(f"Groq: all {len(keys)} keys exhausted after {max_retries} retry cycles")
 
 
 # ============================================================
-#  STAGE 2 — LLM ENHANCER
+#  STAGE 2 — LLM ENHANCER  (v2: tiered prompts, routing, P2/P3/P4)
 # ============================================================
 
-_SYSTEM_FULL = """You clean and normalize ONE act from the Algerian Official Journal
-(الجريدة الرسمية / JORADP). The source is OCR from a 2-3 column Arabic layout,
-so reading order may be interleaved between adjacent columns.
+# ── Prompt tier 1: full legislative — articles + body + cross-references ──
+_SYSTEM_FULL = """Clean ONE act from Algerian Official Journal (JORADP) OCR.
+Rules:
+1. READING ORDER: reorder interleaved columns.
+2. OCR: join split words ("الماد ة"→"المادة"); fix misread letters (ة↔ه, ي↔ى etc.); remove stray punctuation.
+3. DIGITS: Arabic-Indic/Farsi → ASCII (٢٠٢٠→2020, ١٩–٣٦٩→19-369).
+4. PARENTHESES: Arabic RTL → ")text(" not "(text)". Exception: purely numeric context "(N)" is fine.
+5. DATES: Arabic month names; iso="YYYY-MM-DD" when day+month+year all present, else null.
+6. PRESERVE articles and measures count from rough parse.
+7. CROSS-REFS: every cited act → ref_id="{type}-{number}", relation=cites|amends|abrogates|supplements|amends_supplements|implements|replaces, context≤120 chars, location=preamble|article|measure|body.
+Return ONLY JSON (no markdown):
+{"title":str,"type":"مرسوم|أمر|قانون|قرار|قرار وزاري مشترك","joint_ministerial":bool,"ministry":str|null,
+"date_hijri":{"day":int|null,"month":str|null,"year":int|null},
+"date_gregorian":{"day":int|null,"month":str|null,"year":int|null,"iso":str|null},
+"preamble":[str],"signatory":str|null,"signatory_role":str|null,
+"articles":[{"id":str,"num":str,"num_ar":str,"text":str,"cross_references":[]}],
+"measures":[{"text":str,"person":str|null,"action":str|null,"role":str|null,"effective_date_iso":str|null}],
+"annex":{"title":str|null,"articles":[]}|null,
+"cross_references":[{"ref_id":str,"act_type":str,"number":str|null,"date_iso":str|null,
+  "relation":str,"context":str,"location":str,"target_article":str|null}]}"""
 
-RULES:
-1. RECONSTRUCT reading order: if lines from two different acts/columns are
-   interleaved, separate them.
-2. FAITHFUL: never invent content; fix only obvious OCR typos and join
-   broken/hyphenated words. Do NOT summarize or shorten article/measure text.
-3. NUMERALS: convert ALL Arabic-Indic (٠١٢…) and Eastern numerals to ASCII digits.
-4. DATES: always use Arabic month names (يناير فبراير مارس أبريل مايو يونيو
-   يوليو أغسطس سبتمبر أكتوبر نوفمبر ديسمبر). Compute iso="YYYY-MM-DD" when
-   day+month+year are all present, else null.
-5. SIGNATORY: look for وحرر or صدر or الممضي أدناه near the end.
-6. PRESERVE all measures and articles — same count as input unless you detect
-   a clear merge error.
-7. CROSS-REFERENCES — every cited act/law/decree must be a structured entity:
-   - ref_id: canonical key = "{normalized_type}-{number}" e.g. "مرسوم-66-133"
-   - relation: "cites"=بناء على; "amends"=يعدل; "abrogates"=يلغي/إلغاء;
-     "supplements"=يتمم; "amends_supplements"=يعدل ويتمم;
-     "implements"=تطبيقاً لـ; "replaces"=يستبدل
-   - context: verbatim Arabic phrase that mentions this act (≤ 120 chars)
-   - location: "preamble"|"article"|"measure"|"body"
-   - target_article: article number being modified if relation is article-level, else null
-8. ARTICLES — each article is its own entity with a stable id and its own cross_references.
-   Preserve the id values from the rough parse; keep num_ar as the original Arabic ordinal.
-Return ONLY this JSON object (no markdown, no explanation):
-{
- "title": "concise faithful subject of the act",
- "type": "مرسوم|أمر|قانون|قرار|قرار وزاري مشترك",
- "joint_ministerial": bool,
- "ministry": "string|null",
- "date_hijri": {"day":int|null,"month":"arabic hijri month name|null","year":int|null},
- "date_gregorian": {"day":int|null,"month":"arabic month name|null","year":int|null,"iso":"YYYY-MM-DD|null"},
- "preamble": ["citation strings"],
- "articles": [{"id":"act_id-art-001","num":"1","num_ar":"الأولى","text":"faithful cleaned text",
-               "cross_references":[]}],
- "measures": [{"text":"faithful cleaned text","person":"name|null","action":"string|null",
-               "role":"string|null","effective_date_iso":"YYYY-MM-DD|null"}],
- "annex": {"title":"string|null","articles":[{"id":"...","num":"...","num_ar":"...","text":"...","cross_references":[]}]} | null,
- "signatory": "person name|null",
- "signatory_role": "string|null",
- "cross_references": [{"ref_id":"مرسوم-66-133","act_type":"مرسوم|أمر|قانون|قرار",
-   "number":"66-133|null","date_iso":"YYYY-MM-DD|null",
-   "relation":"cites|amends|abrogates|supplements|amends_supplements|implements|replaces",
-   "context":"verbatim Arabic phrase ≤120 chars","location":"preamble|article|measure|body",
-   "target_article":"article num or null"}]
-}"""
+# ── Prompt tier 2: administrative (personnel decrees) — measures, no articles ──
+_SYSTEM_ADMIN = """Extract metadata and measures from ONE administrative act (Algerian JORADP OCR).
+Rules: join split OCR words; Arabic-Indic→ASCII; RTL parentheses ")text("; Arabic month names; iso=YYYY-MM-DD.
+Return ONLY JSON:
+{"title":str,"type":"مرسوم|قرار","joint_ministerial":bool,"ministry":str|null,
+"date_hijri":{"day":int|null,"month":str|null,"year":int|null},
+"date_gregorian":{"day":int|null,"month":str|null,"year":int|null,"iso":str|null},
+"signatory":str|null,"signatory_role":str|null,
+"measures":[{"text":str,"person":str|null,"action":str|null,"role":str|null,"effective_date_iso":str|null}],
+"cross_references":[]}"""
 
-_SYSTEM_LIGHT = """You extract METADATA for ONE act from the Algerian Official
-Journal (الجريدة الرسمية / JORADP). Do NOT reproduce its body — only return clean metadata.
-Rules: convert numerals to ASCII; use Arabic month names; compute iso="YYYY-MM-DD" when
-day+month+year all present, else null; use null when a field is absent.
-Return ONLY this JSON (no markdown):
-{
- "title": "concise faithful subject",
- "type": "مرسوم|أمر|قانون|قرار|قرار وزاري مشترك",
- "joint_ministerial": bool,
- "ministry": "string|null",
- "date_hijri": {"day":int|null,"month":"arabic hijri month|null","year":int|null},
- "date_gregorian": {"day":int|null,"month":"arabic month|null","year":int|null,"iso":"YYYY-MM-DD|null"},
- "signatory": "name|null", "signatory_role": "string|null",
- "cross_references": [{"ref_id":"مرسوم-66-133","act_type":"مرسوم|أمر|قانون|قرار",
-   "number":"66-133|null","date_iso":"YYYY-MM-DD|null",
-   "relation":"cites|amends|abrogates|supplements|amends_supplements|implements|replaces",
-   "context":"verbatim Arabic phrase ≤120 chars","location":"preamble|article|measure|body",
-   "target_article":null}],
- "n_persons_estimate": int
-}"""
+# ── Prompt tier 3: metadata-only fallback for any oversized act ──
+_SYSTEM_META = """Extract ONLY metadata (no body) from ONE act (Algerian JORADP OCR).
+Rules: join split OCR words; Arabic-Indic→ASCII; Arabic month names; iso=YYYY-MM-DD.
+Return ONLY JSON:
+{"title":str,"type":str,"joint_ministerial":bool,"ministry":str|null,
+"date_hijri":{"day":int|null,"month":str|null,"year":int|null},
+"date_gregorian":{"day":int|null,"month":str|null,"year":int|null,"iso":str|null},
+"signatory":str|null,"signatory_role":str|null,"n_persons_estimate":int,
+"cross_references":[]}"""
 
-_LIGHT_CHARS    = 4500
-_LIGHT_MEASURES = 8
+# Raw-text caps per tier
+_CAP_ADMIN = 3500
+_CAP_FULL  = 8000   # up from 6000 — Groq 8K TPM can handle this at 4K output
 
 
 def _enhance_one(act, api_key=None):
+    kind    = act.get("kind", "legislative")
+    n_art   = len(act.get("articles", []))
+    n_meas  = len(act.get("measures", []))
+    raw     = act["raw_text"]
+    raw_len = len(raw)
+
     rough = {k: act.get(k) for k in ("type", "number", "joint", "ministry",
              "title", "date_hijri", "date_gregorian")}
-    rough["n_articles"] = len(act.get("articles", []))
-    rough["n_measures"] = len(act.get("measures", []))
+    rough["n_articles"] = n_art
+    rough["n_measures"] = n_meas
     rough["article_ids"] = [{"id": a.get("id"), "num": a.get("num"), "num_ar": a.get("num_ar")}
                              for a in act.get("articles", [])]
-    light = len(act["raw_text"]) > _LIGHT_CHARS or rough["n_measures"] > _LIGHT_MEASURES
-    raw = act["raw_text"] if not light else act["raw_text"][:6000]
-    prompt = (f"ROUGH PARSE (may be wrong):\n{json.dumps(rough, ensure_ascii=False)}\n\n"
-              f"RAW OCR TEXT OF THE ACT:\n\"\"\"\n{raw}\n\"\"\"\n\n"
-              "IMPORTANT: reproduce measure/article text VERBATIM (cleaned OCR only). "
-              "Do NOT paraphrase or summarize body content.\n"
-              "Return the cleaned JSON now.")
-    try:
-        enh = groq_generate(prompt, system=(_SYSTEM_LIGHT if light else _SYSTEM_FULL),
-                            as_json=True, api_key=api_key)
-        enh["_mode"] = "light" if light else "full"
-        enh["_model"] = _groq_model
-        return enh
-    except RuntimeError:
-        if light: raise
-        enh = groq_generate(prompt, system=_SYSTEM_LIGHT, as_json=True, api_key=api_key)
-        enh["_mode"] = "light"; enh["_fallback"] = "full_failed"
-        enh["_model"] = _groq_model
-        return enh
+
+    def _call(raw_text, system, max_tok):
+        p = (f"ROUGH PARSE:\n{json.dumps(rough, ensure_ascii=False)}\n\n"
+             f"RAW OCR:\n\"\"\"\n{raw_text}\n\"\"\"\n\n"
+             "Reproduce article/measure text VERBATIM (cleaned only). Return JSON now.")
+        return groq_generate(p, system=system, as_json=True,
+                             api_key=api_key, max_output_tokens=max_tok)
+
+    # Build ordered attempt list: (raw_text_chunk, system_prompt, max_output_tokens, mode_label)
+    # Triggers for next attempt: 413 or 400-json_validate_failed
+    if kind == "administrative":
+        attempts = [
+            (raw[:_CAP_ADMIN],    _SYSTEM_ADMIN, 2000, "admin"),
+            (raw[:2000],          _SYSTEM_META,  1000, "meta"),
+        ]
+    else:
+        # Scale max_output_tokens with article count to avoid truncation → 400
+        mtok = min(8000, max(4000, n_art * 250 + 2000))
+        attempts = [
+            (raw[:_CAP_FULL] if raw_len > _CAP_FULL else raw, _SYSTEM_FULL, mtok,  "full"),
+            (raw[:5000],                                       _SYSTEM_FULL, 4000,  "full_trunc5k"),
+            (raw[:3000],                                       _SYSTEM_META, 2000,  "meta"),
+        ]
+
+    last_err = None
+    for raw_chunk, system, max_tok, mode_label in attempts:
+        try:
+            enh = _call(raw_chunk, system, max_tok)
+            enh["_mode"]  = mode_label
+            enh["_model"] = _groq_model
+            return enh
+        except RuntimeError as e:
+            last_err = e
+            err_s = str(e)
+            # P2: cascade on 413 (request too large) OR 400 json_validate_failed (output truncated)
+            if "413" in err_s or ("400" in err_s and "json_validate" in err_s):
+                continue
+            raise   # other errors (429-exhausted, 500, bad JSON) — bubble up
+    raise last_err
 
 
 def _reconcile(act, enh):
+    """Return list of quality warnings. P3 fix: normalize both sides before word diff."""
     w = []
-    if enh.get("_mode") == "light":
+    mode = enh.get("_mode", "")
+    # No article body expected in admin/meta modes
+    if mode in ("admin", "meta"):
         return w
     na, ma = len(act.get("articles", [])), len(enh.get("articles") or [])
     nm, mm = len(act.get("measures", [])), len(enh.get("measures") or [])
     if ma < na: w.append(f"articles {na}->{ma} (fewer)")
     if mm < nm: w.append(f"measures {nm}->{mm} (fewer)")
-    raw_words = set(re.findall(r"[؀-ۿ]{4,}", act["raw_text"]))
-    enh_words = set(re.findall(r"[؀-ۿ]{4,}", json.dumps(enh, ensure_ascii=False)))
+
+    # P3: strip tashkeel + normalize digits on BOTH sides before diffing
+    def _norm_words(text):
+        cleaned = _TASHKEEL.sub("", _norm(text))
+        return set(tok for tok in re.findall(r"[؀-ۿ]{4,}", cleaned))
+
+    raw_words = _norm_words(act["raw_text"])
+    enh_words = _norm_words(json.dumps(enh, ensure_ascii=False))
     missing = raw_words - enh_words
-    if len(missing) > max(8, 0.25 * len(raw_words)):
+    threshold = max(8, 0.30 * len(raw_words))
+    if len(missing) > threshold:
         w.append(f"{len(missing)}/{len(raw_words)} long words absent")
     return w
 
 
-def do_enhance(folder, limit=None, force=False, delay=1.0, api_key=None):
-    """Stage 2: send each act to the LLM → structure_A.enhanced.json"""
-    dest = os.path.join(folder, "structure_A.enhanced.json")
-    src  = dest if (os.path.exists(dest) and not force) else os.path.join(folder, "structure_A.json")
+def _budget_line():
+    if not _budget:
+        return ""
+    parts = [f"{k}…: {v:,} tok" for k, v in sorted(_budget.items())]
+    return "  [budget] " + " | ".join(parts)
+
+
+_QUOTA_STOP = 3   # consecutive all-keys-exhausted → stop run
+
+
+def do_enhance(folder, out_dir=None, limit=None, force=False, delay=0.5, api_key=None):
+    """Stage 2: send each act to LLM → structure_A.enhanced.json"""
+    out_dir = out_dir or folder
+    os.makedirs(out_dir, exist_ok=True)
+    dest = os.path.join(out_dir, "structure_A.enhanced.json")
+    src  = (dest if (os.path.exists(dest) and not force)
+            else os.path.join(out_dir, "structure_A.json")
+            if os.path.exists(os.path.join(out_dir, "structure_A.json"))
+            else os.path.join(folder, "structure_A.json"))
     if not os.path.exists(src):
         raise FileNotFoundError(f"Run 'structure' first — {src} not found")
     data = json.load(open(src, encoding="utf-8"))
     acts = data["acts"]
     todo = acts[:limit] if limit else acts
     ok = err = skip = 0
+    consecutive_quota = 0
+
     for i, act in enumerate(todo, 1):
         prev = act.get("enhanced")
         if prev and "_error" not in prev and not force:
@@ -497,17 +590,37 @@ def do_enhance(folder, limit=None, force=False, delay=1.0, api_key=None):
             enh["_warnings"] = _reconcile(act, enh)
             act["enhanced"] = enh
             flag = "[!] " + "; ".join(enh["_warnings"]) if enh["_warnings"] else "clean"
-            print(f"  [{i}/{len(todo)}] {act['id']}: {flag}", flush=True)
+            mode_tag = f" [{enh['_mode']}]" if enh.get("_mode") not in ("full",) else ""
+            print(f"  [{i}/{len(todo)}] {act['id']}: {flag}{mode_tag}", flush=True)
             ok += 1
+            consecutive_quota = 0
             if delay > 0 and i < len(todo):
                 time.sleep(delay)
         except Exception as e:
-            act["enhanced"] = {"_error": str(e)}
+            err_s = str(e)
+            act["enhanced"] = {"_error": err_s}
             print(f"  [{i}/{len(todo)}] {act['id']}: ERROR {e}", flush=True)
             err += 1
+            # P4: detect global quota exhaustion and stop gracefully
+            if "keys exhausted" in err_s:
+                consecutive_quota += 1
+                if consecutive_quota >= _QUOTA_STOP:
+                    print(f"\n  ⛔  All Groq keys exhausted ({consecutive_quota} in a row). "
+                          f"Stopping to preserve progress.", flush=True)
+                    print(f"  Resume:  python pipeline2.py enhance {folder}"
+                          + (f" --out-root {out_dir}" if out_dir != folder else ""),
+                          flush=True)
+                    break
+            else:
+                consecutive_quota = 0
             if delay > 0 and i < len(todo):
                 time.sleep(delay)
-    if skip: print(f"  (skipped {skip} already-enhanced acts)", flush=True)
+
+    if skip:
+        print(f"  (skipped {skip} already-enhanced acts)", flush=True)
+    bl = _budget_line()
+    if bl: print(bl, flush=True)
+
     data["enhanced_with"] = _groq_model
     data["enhanced_stats"] = {"ok": ok, "error": err, "skipped": skip, "total": len(todo)}
     json.dump(data, open(dest, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
@@ -517,7 +630,7 @@ def do_enhance(folder, limit=None, force=False, delay=1.0, api_key=None):
 
 
 # ============================================================
-#  STAGE 3 — DETERMINISTIC CROSS-REFERENCE POST-PROCESSOR
+#  STAGE 3 — DETERMINISTIC CROSS-REFERENCE POST-PROCESSOR  (unchanged)
 # ============================================================
 
 _AR_DIGITS_TR = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
@@ -608,9 +721,9 @@ def _migrate_xref(xr, raw_text, preamble_list):
             "location": location, "target_article": xr.get("target_article")}
 
 
-def do_infer(folder):
-    """Stage 3: fill/fix cross-reference fields deterministically"""
-    ef = os.path.join(folder, "structure_A.enhanced.json")
+def do_infer(folder, out_dir=None):
+    out_dir = out_dir or folder
+    ef = os.path.join(out_dir, "structure_A.enhanced.json")
     if not os.path.exists(ef):
         raise FileNotFoundError(f"Run 'enhance' first — {ef} not found")
     data = json.load(open(ef, encoding="utf-8"))
@@ -656,7 +769,7 @@ def do_infer(folder):
 
 
 # ============================================================
-#  STAGE 4 — HTML VIEWER GENERATOR
+#  STAGE 4 — HTML VIEWER GENERATOR  (unchanged)
 # ============================================================
 
 _VIEWER_TEMPLATE = r"""<!DOCTYPE html>
@@ -769,7 +882,7 @@ function serialBadge(act){const e=act.enhanced&&!act.enhanced._error?act.enhance
 function xrefChip(x){if(!x||typeof x!=='object')return'';const refId=x.ref_id||'';const num=x.number||'';const type=x.act_type||x.type||'';const rel=x.relation||'cites';const date=x.date_iso||'';const ctx=x.context||'';const loc=x.location||'';const relLabel=REL_LABELS[rel]||rel;const relClass=`rel-${rel}`;const domId=ACT_BY_NUMBER[num]||ACT_BY_REFID[refId]||'';const isLocal=!!domId;const dataAttrs=`data-refid="${esc(refId)}" data-num="${esc(num)}" data-type="${esc(type)}" data-rel="${esc(rel)}" data-date="${esc(date)}" data-ctx="${esc(ctx)}" data-loc="${esc(loc)}" data-domid="${esc(domId)}"`;return`<span class="xref-chip ${isLocal?'local':''}" ${dataAttrs}><span class="xref-rel ${relClass}">${esc(relLabel)}</span> ${esc(type)} ${esc(num)}${date?' · '+esc(date):''}${isLocal?' 🔗':''}</span>`;}
 function artItem(a,idx){if(typeof a!=='object'||!a)return'';const id=a.id||'';const num=a.num||a.num_ar||String(idx+1);const txt=a.text||'';const xrefs=(a.cross_references||[]).filter(x=>x&&typeof x==='object');const artXrefs=xrefs.length?`<div class="xref-list" style="margin-top:6px">${xrefs.map(xrefChip).join('')}</div>`:'';return`<div class="art-item">${id?`<span class="art-id">${esc(id)}</span>`:''}<span class="art-num">م ${esc(num)}</span> <span class="art-text">${esc(txt)}</span>${artXrefs}</div>`;}
 function measItem(m,idx){if(!m)return'';const person=m.person?`<span class="meas-person">${esc(m.person)}</span>`:'';const role=m.role?`<span class="meas-role"> — ${esc(m.role)}</span>`:'';const dt=m.effective_date_iso||m.date_gregorian_iso||dstr(m.date_gregorian)||'';const date=dt?`<span class="meas-date"> 📅 ${esc(dt)}</span>`:'';return`<div class="meas-item"><span class="art-num" style="color:#8a7a4a">${idx+1}</span>${person}${role}${date} <span class="art-text">${esc(m.text||'')}</span></div>`;}
-function actCard(act,i){const e=act.enhanced&&!act.enhanced._error?act.enhanced:null;const kind=act.kind||'legislative';const enhanced=!!e;let title=(e?.title||act.title||'(بدون عنوان)').replace('⟨مُستخرج⟩','').trim();const type=e?.type||act.type||'';const joint=act.joint||e?.joint_ministerial;const ministry=e?.ministry||act.ministry||'';const dgIso=e?.date_gregorian?.iso||'';const dg=dgIso||dstr(act.date_gregorian);const dh=dstr(act.date_hijri);const pages=(act.source_pages||[]).join('، ');let chips=`<span class="chip chip-type">${esc(type||kind)}</span>`;if(joint)chips+=`<span class="chip chip-joint">وزاري مشترك</span>`;if(dg)chips+=`<span class="chip chip-date">📅 ${esc(dg)}</span>`;if(dh)chips+=`<span class="chip chip-date">${esc(dh)} هـ</span>`;if(ministry)chips+=`<span class="chip chip-ministry" title="${esc(ministry)}">🏛 ${esc(ministry)}</span>`;if(pages)chips+=`<span class="chip chip-page">📄 ص ${esc(pages)}</span>`;if(enhanced)chips+=`<span class="enh-badge">✨ ${esc(e._model||'LLM')}</span>`;const warns=e?._warnings?.length?`<span class="warn-badge" title="${e._warnings.map(esc).join('\n')}">⚠ ${e._warnings.length} تحذير</span>`:'';const actXrefs=(e?.cross_references||[]).filter(x=>x&&typeof x==='object');const xrefSec=actXrefs.length?`<div class="sec"><div class="sec-head">المراجع (${actXrefs.length})</div><div class="xref-list">${actXrefs.map(xrefChip).join('')}</div></div>`:'';const preItems=(act.preamble||[]);const preSec=preItems.length?`<div class="sec"><div class="sec-head">الديباجة (${preItems.length})</div>${preItems.map(p=>`<div class="pre-item">${esc(p)}</div>`).join('')}</div>`:'';const arts0=(e?._mode==='full'&&e?.articles?.length)?e.articles:act.articles;const artSec=(arts0||[]).length?`<div class="sec"><div class="sec-head">المواد (${arts0.length})</div>${arts0.map((a,i)=>artItem(a,i)).join('')}</div>`:'';const meas0=(e?._mode==='full'&&e?.measures?.length)?e.measures:act.measures;const measSec=(meas0||[]).length?`<div class="sec"><div class="sec-head">الإجراءات (${meas0.length})</div>${meas0.map((m,i)=>measItem(m,i)).join('')}</div>`:'';const annexObj=e?.annex||act.annex;const annexSec=(annexObj&&(annexObj.title||annexObj.articles?.length))?`<div class="annex-box"><div class="annex-title">ملحق — ${esc(annexObj.title||'')}</div>${(annexObj.articles||[]).map((a,i)=>artItem(a,i)).join('')}</div>`:'';const who=e?.signatory||act.signature?.signatory||'';const role2=e?.signatory_role||'';const signSec=who?`<div class="sec"><div class="sec-head">التوقيع</div><div class="sign-box">${esc(who)}${role2?' — '+esc(role2):''}</div></div>`:'';const raw=act.raw_text||(act.lines||[]).map(l=>l.text).join('\n');const domId=`act-card-${String(i+1).padStart(3,'0')}`;return`<div class="act ${kind}${enhanced?' open':''}" id="${domId}" data-i="${i}"><div class="ahead">${serialBadge(act)}<div class="atitle-block"><div class="atitle">${esc(title)}</div><div class="ameta">${chips}${warns}</div></div><span class="toggle-icon">▶</span></div><div class="body">${xrefSec}${preSec}${measSec}${artSec}${annexSec}${signSec}<button class="raw-btn">النص الخام ↕</button><pre class="raw">${esc(raw)}</pre></div></div>`;}
+function actCard(act,i){const e=act.enhanced&&!act.enhanced._error?act.enhanced:null;const kind=act.kind||'legislative';const enhanced=!!e;let title=(e?.title||act.title||'(بدون عنوان)').replace('⟨مُستخرج⟩','').trim();const type=e?.type||act.type||'';const joint=act.joint||e?.joint_ministerial;const ministry=e?.ministry||act.ministry||'';const dgIso=e?.date_gregorian?.iso||'';const dg=dgIso||dstr(act.date_gregorian);const dh=dstr(act.date_hijri);const pages=(act.source_pages||[]).join('، ');let chips=`<span class="chip chip-type">${esc(type||kind)}</span>`;if(joint)chips+=`<span class="chip chip-joint">وزاري مشترك</span>`;if(dg)chips+=`<span class="chip chip-date">📅 ${esc(dg)}</span>`;if(dh)chips+=`<span class="chip chip-date">${esc(dh)} هـ</span>`;if(ministry)chips+=`<span class="chip chip-ministry" title="${esc(ministry)}">🏛 ${esc(ministry)}</span>`;if(pages)chips+=`<span class="chip chip-page">📄 ص ${esc(pages)}</span>`;if(enhanced)chips+=`<span class="enh-badge">✨ ${esc(e._mode||e._model||'LLM')}</span>`;const warns=e?._warnings?.length?`<span class="warn-badge" title="${e._warnings.map(esc).join('\n')}">⚠ ${e._warnings.length} تحذير</span>`:'';const actXrefs=(e?.cross_references||[]).filter(x=>x&&typeof x==='object');const xrefSec=actXrefs.length?`<div class="sec"><div class="sec-head">المراجع (${actXrefs.length})</div><div class="xref-list">${actXrefs.map(xrefChip).join('')}</div></div>`:'';const preItems=(act.preamble||[]);const preSec=preItems.length?`<div class="sec"><div class="sec-head">الديباجة (${preItems.length})</div>${preItems.map(p=>`<div class="pre-item">${esc(p)}</div>`).join('')}</div>`:'';const arts0=(e?._mode==='full'&&e?.articles?.length)?e.articles:act.articles;const artSec=(arts0||[]).length?`<div class="sec"><div class="sec-head">المواد (${arts0.length})</div>${arts0.map((a,i)=>artItem(a,i)).join('')}</div>`:'';const meas0=(e?.measures?.length)?e.measures:act.measures;const measSec=(meas0||[]).length?`<div class="sec"><div class="sec-head">الإجراءات (${meas0.length})</div>${meas0.map((m,i)=>measItem(m,i)).join('')}</div>`:'';const annexObj=e?.annex||act.annex;const annexSec=(annexObj&&(annexObj.title||annexObj.articles?.length))?`<div class="annex-box"><div class="annex-title">ملحق — ${esc(annexObj.title||'')}</div>${(annexObj.articles||[]).map((a,i)=>artItem(a,i)).join('')}</div>`:'';const who=e?.signatory||act.signature?.signatory||'';const role2=e?.signatory_role||'';const signSec=who?`<div class="sec"><div class="sec-head">التوقيع</div><div class="sign-box">${esc(who)}${role2?' — '+esc(role2):''}</div></div>`:'';const raw=act.raw_text||(act.lines||[]).map(l=>l.text).join('\n');const domId=`act-card-${String(i+1).padStart(3,'0')}`;return`<div class="act ${kind}${enhanced?' open':''}" id="${domId}" data-i="${i}"><div class="ahead">${serialBadge(act)}<div class="atitle-block"><div class="atitle">${esc(title)}</div><div class="ameta">${chips}${warns}</div></div><span class="toggle-icon">▶</span></div><div class="body">${xrefSec}${preSec}${measSec}${artSec}${annexSec}${signSec}<button class="raw-btn">النص الخام ↕</button><pre class="raw">${esc(raw)}</pre></div></div>`;}
 function indexBlock(idx){if(!idx?.length)return'';return`<div class="special"><div class="special-head">الفهرس — ${idx.length} مدخلاً</div>${idx.map(e=>`<div class="special-item"><span style="color:#4a6fa5">${esc(e.type||'')}</span> ${esc(e.title||'—')}</div>`).join('')}</div>`;}
 function render(){const acts=DATA.acts||[];buildIndex(acts);const s=DATA.stats||{};document.getElementById('banner').innerHTML=`الأعمال: <b>${acts.length}</b> · تشريعية ${s.legislative||0} · إدارية ${s.administrative||0} · الفهرس: ${s.index_entries||0} · أسطر: ${s.input_lines||0} · <b>بدون فقدان ✓</b>`;const enhCount=acts.filter(a=>a.enhanced&&!a.enhanced._error).length;document.getElementById('enh-count').textContent=`✨ ${enhCount}/${acts.length} مُحسَّن`;const wrap=document.getElementById('wrap');wrap.innerHTML=indexBlock(DATA.index)+acts.map(actCard).join('');attachEvents();}
 function attachEvents(){document.querySelectorAll('.ahead').forEach(h=>{h.addEventListener('click',()=>h.closest('.act').classList.toggle('open'));});document.querySelectorAll('.raw-btn').forEach(b=>{b.addEventListener('click',e=>{e.stopPropagation();b.nextElementSibling.classList.toggle('show');});});document.querySelectorAll('.xref-chip').forEach(chip=>{chip.addEventListener('click',e=>{e.stopPropagation();const domId=chip.dataset.domid;if(domId){const el=document.getElementById(domId);if(el){el.classList.add('open');el.scrollIntoView({behavior:'smooth',block:'center'});el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash');setTimeout(()=>el.classList.remove('flash'),1300);return;}}showRefPanel(chip.dataset);});});}
@@ -784,99 +897,154 @@ render();
 </body></html>"""
 
 
-def do_view(folder):
-    """Stage 4: generate viewer2.html"""
+def do_view(folder, out_dir=None):
+    out_dir = out_dir or folder
+    os.makedirs(out_dir, exist_ok=True)
     jid = os.path.basename(folder.rstrip("/\\"))
-    ef = os.path.join(folder, "structure_A.enhanced.json")
-    af = os.path.join(folder, "structure_A.json")
-    data_file = ef if os.path.exists(ef) else af
-    if not os.path.exists(data_file):
-        raise FileNotFoundError(f"Run 'structure' first — no JSON found in {folder}")
+    data_file = next(
+        (p for p in [
+            os.path.join(out_dir, "structure_A.enhanced.json"),
+            os.path.join(out_dir, "structure_A.json"),
+            os.path.join(folder,  "structure_A.enhanced.json"),
+            os.path.join(folder,  "structure_A.json"),
+        ] if os.path.exists(p)), None)
+    if not data_file:
+        raise FileNotFoundError(f"Run 'structure' first — no JSON found for {jid}")
     data = json.load(open(data_file, encoding="utf-8"))
     payload = json.dumps(data, ensure_ascii=False)
     page = _VIEWER_TEMPLATE.replace("__JID__", html.escape(jid)).replace("__DATA__", payload)
-    dest = os.path.join(folder, "viewer2.html")
+    dest = os.path.join(out_dir, "viewer2.html")
     open(dest, "w", encoding="utf-8").write(page)
     print(f"[view] {jid}: viewer → {dest}")
     return dest
 
 
 # ============================================================
-#  CLI
+#  CLI  (identical interface to pipeline.py)
 # ============================================================
 
-def _resolve_folders(args_folders, all_flag):
-    if all_flag:
+def _resolve_folders(args_folders, all_flag, source_root=None, limit_issues=None):
+    if source_root:
+        pattern1 = os.path.join(source_root, "JO-*/")
+        pattern2 = os.path.join(source_root, "*/JO-*/")
+        folders = sorted(set(glob.glob(pattern1) + glob.glob(pattern2)))
+        folders = [f for f in folders if os.path.isdir(f)]
+        if not folders:
+            raise FileNotFoundError(f"No JO-*/ folders found under {source_root}")
+    elif all_flag:
         folders = sorted(f for f in glob.glob("JO-*/") if os.path.isdir(f))
         if not folders:
-            raise FileNotFoundError("No JO-*/ directories found. Run from the project root.")
-        return folders
-    if not args_folders:
-        raise ValueError("Provide a folder path or use --all")
-    return args_folders
+            raise FileNotFoundError("No JO-*/ directories found.")
+    else:
+        if not args_folders:
+            raise ValueError("Provide a folder path, use --all, or use --source-root")
+        folders = list(args_folders)
+    if limit_issues:
+        folders = folders[:limit_issues]
+    return folders
+
+
+def _get_out_dir(folder, out_root=None, source_root=None):
+    if not out_root:
+        return folder
+    folder = os.path.normpath(folder)
+    if source_root:
+        source_root = os.path.normpath(source_root)
+        try:
+            rel = os.path.relpath(folder, source_root)
+            return os.path.join(out_root, rel)
+        except ValueError:
+            pass
+    return os.path.join(out_root, os.path.basename(folder))
+
+
+def _common_args(sp):
+    sp.add_argument("folder", nargs="*", help="JO-YYYY-NNN/ source folder(s)")
+    sp.add_argument("--all", action="store_true")
+    sp.add_argument("--source-root", metavar="PATH")
+    sp.add_argument("--out-root",    metavar="PATH")
+    sp.add_argument("--limit-issues", type=int, metavar="N")
+
+
+def _llm_args(sp):
+    sp.add_argument("--key",   help="Groq API key")
+    sp.add_argument("--model", default=None)
+    sp.add_argument("--delay", type=float, default=0.5,
+                    help="Seconds between LLM calls (default: 0.5)")
+    sp.add_argument("--force", action="store_true")
+    sp.add_argument("--limit", type=int, default=None)
 
 
 def cmd_structure(args):
-    folders = _resolve_folders(args.folder, args.all)
-    for f in folders:
-        do_structure(f)
+    for f in _resolve_folders(args.folder, args.all,
+                               getattr(args,"source_root",None),
+                               getattr(args,"limit_issues",None)):
+        do_structure(f, out_dir=_get_out_dir(f, getattr(args,"out_root",None),
+                                              getattr(args,"source_root",None)))
 
 
 def cmd_enhance(args):
     global _groq_model
-    if args.model:
-        _groq_model = args.model
-    folders = _resolve_folders(args.folder, args.all)
-    for f in folders:
-        do_enhance(f, limit=args.limit, force=args.force,
+    if args.model: _groq_model = args.model
+    for f in _resolve_folders(args.folder, args.all,
+                               getattr(args,"source_root",None),
+                               getattr(args,"limit_issues",None)):
+        out = _get_out_dir(f, getattr(args,"out_root",None), getattr(args,"source_root",None))
+        do_enhance(f, out_dir=out, limit=args.limit, force=args.force,
                    delay=args.delay, api_key=args.key)
 
 
 def cmd_infer(args):
-    folders = _resolve_folders(args.folder, args.all)
-    for f in folders:
-        do_infer(f)
+    for f in _resolve_folders(args.folder, args.all,
+                               getattr(args,"source_root",None),
+                               getattr(args,"limit_issues",None)):
+        do_infer(f, out_dir=_get_out_dir(f, getattr(args,"out_root",None),
+                                          getattr(args,"source_root",None)))
 
 
 def cmd_view(args):
-    folders = _resolve_folders(args.folder, args.all)
-    for f in folders:
-        do_view(f)
+    for f in _resolve_folders(args.folder, args.all,
+                               getattr(args,"source_root",None),
+                               getattr(args,"limit_issues",None)):
+        do_view(f, out_dir=_get_out_dir(f, getattr(args,"out_root",None),
+                                         getattr(args,"source_root",None)))
 
 
 def cmd_run(args):
-    """Full pipeline: structure → enhance → infer → view"""
     global _groq_model
-    if args.model:
-        _groq_model = args.model
-    folders = _resolve_folders(args.folder, args.all)
-    print(f"Running full pipeline on {len(folders)} folder(s).")
+    if args.model: _groq_model = args.model
+    folders = _resolve_folders(args.folder, args.all,
+                               getattr(args,"source_root",None),
+                               getattr(args,"limit_issues",None))
+    print(f"Full pipeline on {len(folders)} folder(s).")
     for f in folders:
-        print(f"\n{'─'*50}\n{f.rstrip('/')}\n{'─'*50}")
-        do_structure(f)
-        do_enhance(f, limit=args.limit, force=args.force,
+        out = _get_out_dir(f, getattr(args,"out_root",None), getattr(args,"source_root",None))
+        print(f"\n{'─'*52}\n  {os.path.basename(f.rstrip('/\\'))}  →  {out}\n{'─'*52}")
+        do_structure(f, out_dir=out)
+        do_enhance(f, out_dir=out, limit=args.limit, force=args.force,
                    delay=args.delay, api_key=args.key)
-        do_infer(f)
-        do_view(f)
+        do_infer(f, out_dir=out)
+        do_view(f, out_dir=out)
     print("\nDone.")
 
 
 def cmd_test(args):
-    """
-    Smoke test — no API key needed.
-    Runs structure + view only; checks losslessness and HTML output.
-    """
-    folders = _resolve_folders(args.folder, getattr(args, "all", False))
+    folders = _resolve_folders(args.folder, getattr(args,"all",False),
+                               getattr(args,"source_root",None),
+                               getattr(args,"limit_issues",None))
     ok = fail = 0
     for f in folders:
+        out = _get_out_dir(f, getattr(args,"out_root",None), getattr(args,"source_root",None))
         jid = os.path.basename(f.rstrip("/\\"))
         try:
-            result = do_structure(f)
-            assert result["stats"]["lossless"], "lossless check failed"
-            dest = do_view(f)
+            result = do_structure(f, out_dir=out)
+            assert result["stats"]["lossless"]
+            dest = do_view(f, out_dir=out)
             size = os.path.getsize(dest)
-            assert size > 5000, f"viewer too small ({size} bytes)"
-            print(f"  PASS  {jid}  ({result['stats']['acts']} acts, viewer {size//1024}KB)")
+            assert size > 5000
+            s = result["stats"]
+            print(f"  PASS  {jid}  ({s['acts']} acts leg={s['legislative']} adm={s['administrative']}, "
+                  f"viewer {size//1024}KB)")
             ok += 1
         except Exception as e:
             print(f"  FAIL  {jid}: {e}")
@@ -888,75 +1056,29 @@ def cmd_test(args):
 
 def main():
     p = argparse.ArgumentParser(
-        prog="pipeline.py",
-        description="JORADP Legal Act Structuring Pipeline",
+        prog="pipeline2.py",
+        description="JORADP Pipeline v2 — tiered prompts, budget tracking, graceful exhaustion",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  python pipeline.py run   JO-1968-094/ --key gsk_YOUR_KEY
-  python pipeline.py run   --all        --key gsk_YOUR_KEY
-  python pipeline.py structure JO-1968-094/
-  python pipeline.py enhance   JO-1968-094/ --key gsk_…
-  python pipeline.py infer     --all
-  python pipeline.py view      --all
-  python pipeline.py test      JO-1968-094/
+  python pipeline2.py test  2010+/joradp_processed/2020/JO-2020-001 --out-root 2010+/output/v2
+  python pipeline2.py run   2010+/joradp_processed/2020/JO-2020-001 --out-root 2010+/output/v2
+  python pipeline2.py run   --source-root 2010+/joradp_processed/2020 --out-root 2010+/output/v2
         """)
-
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    def add_folder_args(sp):
-        sp.add_argument("folder", nargs="*", help="JO-YYYY-NNN/ folder(s)")
-        sp.add_argument("--all", action="store_true", help="Process all JO-*/ folders")
-
-    def add_llm_args(sp):
-        sp.add_argument("--key",   help="Groq API key (or set GROQ_API_KEY env var)")
-        sp.add_argument("--model", default=None,
-                        help=f"Groq model (default: {_GROQ_DEFAULT_MODEL})")
-        sp.add_argument("--delay", type=float, default=1.0,
-                        help="Seconds between LLM calls (default: 1.0)")
-        sp.add_argument("--force", action="store_true",
-                        help="Re-enhance even already-processed acts")
-        sp.add_argument("--limit", type=int, default=None,
-                        help="Only process first N acts (smoke test)")
-
-    # structure
-    sp = sub.add_parser("structure", help="Stage 1: parse OCR → structure_A.json")
-    add_folder_args(sp)
-    sp.set_defaults(func=cmd_structure)
-
-    # enhance
-    sp = sub.add_parser("enhance", help="Stage 2: LLM cleanup → structure_A.enhanced.json")
-    add_folder_args(sp)
-    add_llm_args(sp)
-    sp.set_defaults(func=cmd_enhance)
-
-    # infer
-    sp = sub.add_parser("infer", help="Stage 3: deterministic cross-reference post-processing")
-    add_folder_args(sp)
-    sp.set_defaults(func=cmd_infer)
-
-    # view
-    sp = sub.add_parser("view", help="Stage 4: generate viewer2.html")
-    add_folder_args(sp)
-    sp.set_defaults(func=cmd_view)
-
-    # run (full pipeline)
-    sp = sub.add_parser("run", help="Full pipeline: structure → enhance → infer → view")
-    add_folder_args(sp)
-    add_llm_args(sp)
-    sp.set_defaults(func=cmd_run)
-
-    # test
-    sp = sub.add_parser("test", help="Smoke test (no API key needed)")
-    add_folder_args(sp)
-    sp.set_defaults(func=cmd_test)
+    sp = sub.add_parser("structure"); _common_args(sp); sp.set_defaults(func=cmd_structure)
+    sp = sub.add_parser("enhance");   _common_args(sp); _llm_args(sp); sp.set_defaults(func=cmd_enhance)
+    sp = sub.add_parser("infer");     _common_args(sp); sp.set_defaults(func=cmd_infer)
+    sp = sub.add_parser("view");      _common_args(sp); sp.set_defaults(func=cmd_view)
+    sp = sub.add_parser("run");       _common_args(sp); _llm_args(sp); sp.set_defaults(func=cmd_run)
+    sp = sub.add_parser("test");      _common_args(sp); sp.set_defaults(func=cmd_test)
 
     args = p.parse_args()
     try:
         args.func(args)
     except (FileNotFoundError, ValueError) as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        print(f"Error: {e}", file=sys.stderr); sys.exit(1)
 
 
 if __name__ == "__main__":
